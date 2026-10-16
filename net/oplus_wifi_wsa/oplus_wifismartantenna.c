@@ -12,6 +12,7 @@
  *******************************************************************************/
 
 #include <linux/types.h>
+#include <linux/capability.h>
 #include <linux/ip.h>
 #include <linux/netfilter.h>
 #include <linux/module.h>
@@ -194,6 +195,7 @@ static struct genl_ops wsa_ops[] = {
         {
                 .doit = wsa_doit,
                 .cmd = WSA_CMD_SWITCH_ANT,
+                .flags = GENL_ADMIN_PERM,
         },
 };
 
@@ -212,6 +214,10 @@ static struct genl_family wsa_family = {
 /* register for /sys/module/oplus_wifismartantenna/parameters/oplus_wsa */
 static int oplus_wsa_sysmodule_ops_set(const char *kmessage, const struct kernel_param *kp)
 {
+        /* Match generic-netlink control: initial-user-namespace authority. */
+        if (!capable(CAP_NET_ADMIN))
+                return -EPERM;
+
         if (!kmessage) {
                 debug("%s error: kmessage == null!", __func__);
                 return -1;
