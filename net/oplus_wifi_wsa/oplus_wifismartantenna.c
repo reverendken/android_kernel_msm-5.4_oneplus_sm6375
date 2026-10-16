@@ -11,57 +11,37 @@
  ** ------------------------------------------------------------------------------
  *******************************************************************************/
 
-#include <linux/types.h>
 #include <linux/capability.h>
-#include <linux/ip.h>
-#include <linux/netfilter.h>
-#include <linux/module.h>
-#include <linux/skbuff.h>
-#include <linux/icmp.h>
-#include <linux/sysctl.h>
-#include <net/route.h>
-#include <net/ip.h>
-#include <linux/bitops.h>
+#include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/err.h>
-#include <linux/version.h>
-#include <net/tcp.h>
-#include <linux/random.h>
-#include <net/sock.h>
-#include <net/dst.h>
-#include <linux/file.h>
-#include <net/tcp_states.h>
-#include <net/sch_generic.h>
-#include <net/pkt_sched.h>
-#include <net/netfilter/nf_queue.h>
-#include <linux/netfilter/xt_state.h>
-#include <linux/netfilter/x_tables.h>
-#include <linux/netfilter/xt_owner.h>
-#include <net/netfilter/nf_conntrack.h>
-#include <net/netfilter/nf_conntrack_core.h>
-#include <net/netfilter/ipv4/nf_conntrack_ipv4.h>
-#include <linux/gpio.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/pinctrl/consumer.h>
-#include <linux/regulator/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
 #include <net/genetlink.h>
 
-#define CONFIG_ONLY_CONTROL_GPIO
+/* This N30 implementation retains the OEM's effective GPIO-only path. */
+struct oplus_wsa {
+        struct device *dev;
+        struct pinctrl *pinctrl;
+        struct pinctrl_state *high;
+        struct pinctrl_state *low;
+        bool level_valid;
+};
 
-#define LOG_TAG "[oplus_wsa] %s line:%d "
-#define debug(fmt, args...) printk(LOG_TAG fmt, __FUNCTION__, __LINE__, ##args)
-
-/* gpio number and gpio level*/
-static long oplus_wsa_gpiolevel = 0;
-
-struct pinctrl *wsa_pinctl = NULL;
-struct pinctrl_state *pinctrl_state_high = NULL;
-struct pinctrl_state *pinctrl_state_low = NULL;
-struct pinctrl_state *pa_pinctrl_state_high = NULL;
-struct pinctrl_state *pa_pinctrl_state_low = NULL;
-
-struct regulator *vdd_reg = NULL;
+/* The wire protocol has no device selector: permit one bound device only.
+ * All active-pointer, pinctrl and cached-level accesses use this mutex.
+ * Never hold it while registering/unregistering either framework.
+ */
+static DEFINE_MUTEX(wsa_lock);
+static struct oplus_wsa *wsa_active;
+static long oplus_wsa_gpiolevel;
 
 enum {
         OPLUS_WSA_LOW = 0x13,
@@ -73,125 +53,75 @@ enum {
         WSA_ATTR_ANT_IDX,  /* u32 */
         __WSA_ATTR_MAX,
 };
-#define WSA_ATTR_MAX   (__WSA_ATTR_MAX - 1)
+#define WSA_ATTR_MAX (__WSA_ATTR_MAX - 1)
 
 enum {
         WSA_CMD_UNSPEC,
         WSA_CMD_SWITCH_ANT,
         __WSA_CMD_MAX,
 };
-#define WSA_CMD_MAX    (__WSA_CMD_MAX - 1)
 
-static struct nla_policy wsa_cmd_policy[WSA_ATTR_MAX + 1] = {
-        [WSA_ATTR_ANT_IDX] = {.type =  NLA_U32, },
+static const struct nla_policy wsa_cmd_policy[WSA_ATTR_MAX + 1] = {
+        [WSA_ATTR_ANT_IDX] = { .type = NLA_U32 },
 };
 
-
-static int oplus_switch_to_secondary_antenna()
+/* Last successful requested level, not an electrical readback. A failed
+ * selection may partially affect hardware, so invalidate rather than invent
+ * rollback or claim the old level is still effective.
+ */
+static int oplus_wsa_set_level(long level)
 {
-#ifdef CONFIG_ONLY_CONTROL_GPIO
-        if (!wsa_pinctl || !pinctrl_state_high) {
-                debug("pinctrl is NULL");
-                return -ENOENT;
+        struct oplus_wsa *wsa;
+        int ret;
+
+        if (level != 0 && level != 1)
+                return -EINVAL;
+
+        mutex_lock(&wsa_lock);
+        wsa = wsa_active;
+        if (!wsa) {
+                ret = -ENODEV;
+                goto out;
         }
 
-        debug("%s is high sec", __func__);
-        /* toggle antenna switch to secondary antenna */
-        pinctrl_select_state(wsa_pinctl, pinctrl_state_high);
-
-        /* delay 1 us to wait antenna switch */
-        udelay(1);
-#else
-        if (!wsa_pinctl || !pinctrl_state_high || !pa_pinctrl_state_high || !pa_pinctrl_state_low) {
-                debug("pinctrl is NULL");
-                return -ENOENT;
+        ret = pinctrl_select_state(wsa->pinctrl, level ? wsa->high : wsa->low);
+        if (ret) {
+                if (wsa->level_valid)
+                        dev_err_ratelimited(wsa->dev,
+                                "antenna selection failed, level %ld: %d\n",
+                                level, ret);
+                wsa->level_valid = false;
+                goto out;
         }
 
-        debug("%s is high", __func__);
-        /* pa switch need to be toggle to 50ohm */
-        pinctrl_select_state(wsa_pinctl, pa_pinctrl_state_high);
-
-        /* delay 1 us to wait pa switch */
+        /* Preserve the OEM runtime switch-settling delay. */
         udelay(1);
-
-        /* toggle antenna switch to secondary antenna */
-        pinctrl_select_state(wsa_pinctl, pinctrl_state_high);
-
-        /* delay 1 us to wait antenna switch */
-        udelay(1);
-
-        /* turn pa switch to the path */
-        pinctrl_select_state(wsa_pinctl, pa_pinctrl_state_low);
-#endif
-
-        return 0;
-}
-
-static int oplus_switch_to_prime_antenna()
-{
-#ifdef CONFIG_ONLY_CONTROL_GPIO
-        if (!wsa_pinctl || !pinctrl_state_low) {
-                debug("pinctrl is NULL");
-                return -ENOENT;
-        }
-
-        debug("%s is high pri", __func__);
-        /* toggle antenna switch to prime antenna */
-        pinctrl_select_state(wsa_pinctl, pinctrl_state_low);
-
-        /* delay 1 us to wait antenna switch */
-        udelay(1);
-#else
-        if (!wsa_pinctl || !pinctrl_state_low || !pa_pinctrl_state_high || !pa_pinctrl_state_low) {
-                debug("pinctrl is NULL");
-                return -ENOENT;
-        }
-
-        debug("%s is low", __func__);
-        /* pa switch need to be toggle to 50ohm */
-        pinctrl_select_state(wsa_pinctl, pa_pinctrl_state_high);
-
-        /* delay 1 us to wait pa switch */
-        udelay(1);
-
-        /* toggle antenna switch to prime antenna */
-        pinctrl_select_state(wsa_pinctl, pinctrl_state_low);
-
-        /* delay 1 us to wait antenna switch */
-        udelay(1);
-
-        /* turn pa switch to the path */
-        pinctrl_select_state(wsa_pinctl, pa_pinctrl_state_low);
-#endif
-
-        return 0;
+        if (!wsa->level_valid)
+                dev_info_ratelimited(wsa->dev, "antenna control recovered\n");
+        oplus_wsa_gpiolevel = level;
+        wsa->level_valid = true;
+out:
+        mutex_unlock(&wsa_lock);
+        return ret;
 }
 
 static int wsa_doit(struct sk_buff *skb, struct genl_info *info)
 {
-        u32 user_cmd = 0;
-        int ret = 0;
+        (void)skb;
+        if (!info->attrs[WSA_ATTR_ANT_IDX])
+                return -EINVAL;
 
-        if (info->attrs[WSA_ATTR_ANT_IDX]) {
-                user_cmd = nla_get_u32(info->attrs[WSA_ATTR_ANT_IDX]);
-        }
-
-        debug("user_cmd: %d", user_cmd);
-        switch (user_cmd) {
+        switch (nla_get_u32(info->attrs[WSA_ATTR_ANT_IDX])) {
         case OPLUS_WSA_HIGH:
-                ret = oplus_switch_to_secondary_antenna();
-                break;
+                return oplus_wsa_set_level(1);
         case OPLUS_WSA_LOW:
-                ret = oplus_switch_to_prime_antenna();
-                break;
+                return oplus_wsa_set_level(0);
         default:
                 return -EINVAL;
         }
-
-        return ret;
 }
 
-static struct genl_ops wsa_ops[] = {
+static const struct genl_ops wsa_ops[] = {
         {
                 .doit = wsa_doit,
                 .cmd = WSA_CMD_SWITCH_ANT,
@@ -199,11 +129,10 @@ static struct genl_ops wsa_ops[] = {
         },
 };
 
-/* The netlink family */
 static struct genl_family wsa_family = {
         .name = "WSA_GEN_NL",
-        .hdrsize = 0,           /* no private header */
-        .version = 1,           /* no particular meaning now */
+        .hdrsize = 0,
+        .version = 1,
         .maxattr = WSA_ATTR_MAX,
         .policy = wsa_cmd_policy,
         .module = THIS_MODULE,
@@ -211,44 +140,43 @@ static struct genl_family wsa_family = {
         .n_ops = ARRAY_SIZE(wsa_ops),
 };
 
-/* register for /sys/module/oplus_wifismartantenna/parameters/oplus_wsa */
-static int oplus_wsa_sysmodule_ops_set(const char *kmessage, const struct kernel_param *kp)
+static int oplus_wsa_sysmodule_ops_set(const char *kmessage,
+                                     const struct kernel_param *kp)
 {
-        /* Match generic-netlink control: initial-user-namespace authority. */
+        long level;
+        int ret;
+
+        (void)kp;
         if (!capable(CAP_NET_ADMIN))
                 return -EPERM;
+        if (!kmessage)
+                return -EINVAL;
 
-        if (!kmessage) {
-                debug("%s error: kmessage == null!", __func__);
-                return -1;
-        }
-        debug("%s: %s", __func__, kmessage);
+        ret = kstrtol(kmessage, 10, &level);
+        if (ret)
+                return ret;
+        return oplus_wsa_set_level(level);
+}
 
-        if (kstrtol(kmessage, 10, &oplus_wsa_gpiolevel) ||
-                        (oplus_wsa_gpiolevel != 0 && oplus_wsa_gpiolevel != 1)) {
-                debug("%s error: gpiolevel parsing error!", __func__);
-                return -1;
-        }
+static int oplus_wsa_sysmodule_ops_get(char *buffer,
+                                     const struct kernel_param *kp)
+{
+        int ret;
 
-        debug("%s level = %d", __func__, oplus_wsa_gpiolevel);
-
-        if (!wsa_pinctl) {
-                debug("pinctrl is NULL");
-                return -1;
-        }
-
-        if (oplus_wsa_gpiolevel == 1) {
-                oplus_switch_to_secondary_antenna();
-        } else {
-                oplus_switch_to_prime_antenna();
-        }
-
-        return 0;
+        mutex_lock(&wsa_lock);
+        if (!wsa_active)
+                ret = -ENODEV;
+        else if (!wsa_active->level_valid)
+                ret = -EIO;
+        else
+                ret = param_get_long(buffer, kp);
+        mutex_unlock(&wsa_lock);
+        return ret;
 }
 
 static const struct kernel_param_ops oplus_wsa_sysmodule_ops = {
         .set = oplus_wsa_sysmodule_ops_set,
-        .get = param_get_int,
+        .get = oplus_wsa_sysmodule_ops_get,
 };
 
 module_param_cb(oplus_wsa, &oplus_wsa_sysmodule_ops, &oplus_wsa_gpiolevel,
@@ -256,94 +184,67 @@ module_param_cb(oplus_wsa, &oplus_wsa_sysmodule_ops, &oplus_wsa_gpiolevel,
 
 static int oplus_wsa_probe(struct platform_device *pdev)
 {
-        int ret = 0;
-        struct device *dev;
+        struct device *dev = &pdev->dev;
+        struct oplus_wsa *wsa;
+        int ret;
 
-        debug("%s: enter\n", __func__);
+        if (!dev->of_node)
+                return -ENODEV;
 
-        dev = &pdev->dev;
-        if (dev->of_node == NULL) {
-                debug("%s: Can't find compatible node in device tree\n", __func__);
-                return -ENOENT;
+        mutex_lock(&wsa_lock);
+        if (wsa_active) {
+                ret = -EBUSY;
+                goto out;
         }
-
-        wsa_pinctl = devm_pinctrl_get(dev);
-        if (IS_ERR_OR_NULL(wsa_pinctl)) {
-                ret = PTR_ERR(wsa_pinctl);
-                debug("%s: Failed to get pinctrl, err = %d\n", __func__, ret);
-                wsa_pinctl = NULL;
+        wsa = devm_kzalloc(dev, sizeof(*wsa), GFP_KERNEL);
+        if (!wsa) {
+                ret = -ENOMEM;
+                goto out;
+        }
+        wsa->dev = dev;
+        wsa->pinctrl = devm_pinctrl_get(dev);
+        if (IS_ERR_OR_NULL(wsa->pinctrl)) {
+                ret = wsa->pinctrl ? PTR_ERR(wsa->pinctrl) : -ENODEV;
+                goto out;
+        }
+        wsa->high = pinctrl_lookup_state(wsa->pinctrl, "cnss_wlan_wsa_high");
+        if (IS_ERR_OR_NULL(wsa->high)) {
+                ret = wsa->high ? PTR_ERR(wsa->high) : -EINVAL;
+                goto out;
+        }
+        wsa->low = pinctrl_lookup_state(wsa->pinctrl, "cnss_wlan_wsa_low");
+        if (IS_ERR_OR_NULL(wsa->low)) {
+                ret = wsa->low ? PTR_ERR(wsa->low) : -EINVAL;
                 goto out;
         }
 
-        pinctrl_state_high = pinctrl_lookup_state(wsa_pinctl, "cnss_wlan_wsa_high");
-        if (IS_ERR_OR_NULL(pinctrl_state_high)) {
-                ret = PTR_ERR(pinctrl_state_high);
-                debug("%s: Fail to get wsa pinctrl high state, ret=%d", __func__, ret);
-                pinctrl_state_high = NULL;
+        /* Preserve low/primary at probe. Publish only after it succeeds. */
+        ret = pinctrl_select_state(wsa->pinctrl, wsa->low);
+        if (ret)
                 goto out;
-        }
-
-        pinctrl_state_low = pinctrl_lookup_state(wsa_pinctl, "cnss_wlan_wsa_low");
-        if (IS_ERR_OR_NULL(pinctrl_state_low)) {
-                ret = PTR_ERR(pinctrl_state_low);
-                debug("%s: Fail to get wsa pinctrl low state, ret=%d", __func__, ret);
-                pinctrl_state_low = NULL;
-                goto out;
-        }
-
-#ifndef CONFIG_ONLY_CONTROL_GPIO
-        pa_pinctrl_state_high = pinctrl_lookup_state(wsa_pinctl, "cnss_pa_switch_high");
-        if (IS_ERR_OR_NULL(pa_pinctrl_state_high)) {
-                ret = PTR_ERR(pa_pinctrl_state_high);
-                debug("%s: Fail to get pa switch pinctrl high state, ret=%d", __func__, ret);
-                pa_pinctrl_state_high = NULL;
-                goto out;
-        }
-
-        pa_pinctrl_state_low = pinctrl_lookup_state(wsa_pinctl, "cnss_pa_switch_low");
-        if (IS_ERR_OR_NULL(pa_pinctrl_state_low)) {
-                ret = PTR_ERR(pa_pinctrl_state_low);
-                debug("%s: Fail to get pa switch pinctrl low state, ret=%d", __func__, ret);
-                pa_pinctrl_state_low = NULL;
-                goto out;
-        }
-
-        if (of_find_property(dev->of_node, "vdd-supply", NULL)) {
-                vdd_reg = devm_regulator_get(dev, "vdd");
-                if (IS_ERR(vdd_reg)) {
-                        ret = PTR_ERR(vdd_reg);
-                        debug("%s: Fail to get vdd-supply, ret=%d", __func__, ret);
-                }
-        }
-
-        if (vdd_reg) {
-                ret = regulator_enable(vdd_reg);
-                if (ret < 0) {
-                        debug("%s: Fail to enable vdd-supply, ret=%d", __func__, ret);
-                }
-        }
-#endif
-
-        debug("%s init as low state!", __func__);
-        pinctrl_select_state(wsa_pinctl, pinctrl_state_low);
-        return 0;
+        oplus_wsa_gpiolevel = 0;
+        wsa->level_valid = true;
+        platform_set_drvdata(pdev, wsa);
+        wsa_active = wsa;
 out:
+        if (ret && ret != -EPROBE_DEFER)
+                dev_err(dev, "antenna probe failed: %d\n", ret);
+        mutex_unlock(&wsa_lock);
         return ret;
 }
 
 static int oplus_wsa_remove(struct platform_device *pdev)
 {
-        if (wsa_pinctl) {
-                devm_pinctrl_put(wsa_pinctl);
-        }
+        mutex_lock(&wsa_lock);
+        if (wsa_active == platform_get_drvdata(pdev))
+                wsa_active = NULL;
+        platform_set_drvdata(pdev, NULL);
+        mutex_unlock(&wsa_lock);
 
-        if (vdd_reg) {
-                int ret = regulator_disable(vdd_reg);
-                if (ret < 0) {
-                        debug("%s: Fail to disable vdd-supply, ret=%d", __func__, ret);
-                }
-        }
-
+        /* Driver core releases devm resources after this callback. Any
+         * in-flight selection completed before the pointer was cleared;
+         * subsequent commands/getters see no active device.
+         */
         return 0;
 }
 
@@ -352,7 +253,6 @@ static const struct of_device_id oplus_wsa_dt_ids[] = {
         {},
 };
 MODULE_DEVICE_TABLE(of, oplus_wsa_dt_ids);
-
 
 static struct platform_driver oplus_wsa_driver = {
         .probe = oplus_wsa_probe,
@@ -365,14 +265,14 @@ static struct platform_driver oplus_wsa_driver = {
 
 static int __init oplus_wsa_init(void)
 {
-        int ret = 0;
+        int ret;
 
-        platform_driver_register(&oplus_wsa_driver);
+        ret = platform_driver_register(&oplus_wsa_driver);
+        if (ret)
+                return ret;
         ret = genl_register_family(&wsa_family);
-        if (ret) {
-                debug("Failed to register wsa netlink family: %d\n", ret);
-        }
-
+        if (ret)
+                platform_driver_unregister(&oplus_wsa_driver);
         return ret;
 }
 
@@ -381,7 +281,6 @@ static void __exit oplus_wsa_fini(void)
         genl_unregister_family(&wsa_family);
         platform_driver_unregister(&oplus_wsa_driver);
 }
-
 
 module_init(oplus_wsa_init);
 module_exit(oplus_wsa_fini);
